@@ -1,2 +1,1 @@
 timestamp_utc,event_id,event_url,sold_tickets,total_available,sectors_json,success,notes
-2025-08-26T10:00:23.632519+00:00,9045,https://bilety.wislakrakow.com/Stadium/Index?eventId=9045,14288,,[],True,sold from homepage
