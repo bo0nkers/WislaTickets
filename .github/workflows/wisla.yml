@@ -19,18 +19,38 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          fetch-depth: 0               # potrzebne do pull --rebase
+          fetch-depth: 0
           persist-credentials: true
 
       - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
 
+      # cache pip (biblioteki Pythona)
+      - name: Cache pip
+        uses: actions/cache@v3
+        with:
+          path: ~/.cache/pip
+          key: ${{ runner.os }}-pip-${{ hashFiles('requirements.txt') }}
+          restore-keys: |
+            ${{ runner.os }}-pip-
+
       - name: Install deps
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
-          python -m playwright install --with-deps chromium
+
+      # cache Playwright (przeglądarka Chromium itp.)
+      - name: Cache Playwright
+        uses: actions/cache@v3
+        with:
+          path: ~/.cache/ms-playwright
+          key: ${{ runner.os }}-playwright
+          restore-keys: |
+            ${{ runner.os }}-playwright
+
+      - name: Install Playwright Chromium
+        run: python -m playwright install --with-deps chromium
 
       - name: Run scraper
         env:
@@ -52,13 +72,10 @@ jobs:
           git config user.email "github-actions[bot]@users.noreply.github.com"
           BRANCH="${GITHUB_REF_NAME}"
 
-          # Dodaj wszystkie zmiany
           git add -A
           git commit -m "Update snapshots [skip ci]" || echo "No changes to commit"
 
-          # Zsynchronizuj z origin (gdyby ktoś coś dorzucił międzyczasie)
           git fetch origin "${BRANCH}"
           git pull --rebase origin "${BRANCH}" || true
 
-          # Spróbuj push
           git push origin "${BRANCH}" || git push --force-with-lease origin "${BRANCH}"
