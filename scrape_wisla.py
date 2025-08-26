@@ -1,5 +1,5 @@
 import os, re, json, argparse, sys, time
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from dotenv import load_dotenv
 import pandas as pd
 from playwright.sync_api import sync_playwright, TimeoutError as PWTimeout
@@ -31,11 +31,11 @@ def find_sold_in_text(text: str):
 
 def try_read_sold_on(page, url, notes, wait_text_hint=None):
     """
-    Otwiera URL, czeka aż strona się uspokoi i szuka 'Sprzedane bilety: X' w inner_text body.
-    Opcjonalnie może krótko poczekać na tekst-hint (np. 'Sprzedane bilety').
+    Otwiera URL, czeka aż się załaduje i szuka 'Sprzedane bilety: X' w treści strony.
     """
     page.goto(url, wait_until="domcontentloaded")
-    # cookies / zgody
+
+    # Cookies / zgody jeśli są
     for label in ["Tylko niezbędne dane", "Zgadzam się", "Akceptuj", "Accept"]:
         try:
             page.get_by_text(label, exact=False).first.click(timeout=1500)
@@ -49,7 +49,6 @@ def try_read_sold_on(page, url, notes, wait_text_hint=None):
     except PWTimeout:
         notes.append("networkidle timeout")
 
-    # czasem tekst doskakuje chwilę później (JS)
     if wait_text_hint:
         try:
             page.get_by_text(wait_text_hint, exact=False).first.wait_for(timeout=3000)
@@ -61,8 +60,7 @@ def try_read_sold_on(page, url, notes, wait_text_hint=None):
         except:
             pass
 
-    # dajmy JS jeszcze ułamek sekundy
-    time.sleep(0.5)
+    time.sleep(0.5)  # dajmy JS chwilę
 
     try:
         body_text = page.locator("body").inner_text()
@@ -74,7 +72,7 @@ def try_read_sold_on(page, url, notes, wait_text_hint=None):
 
 def save_row_csv(path, row: dict):
     df = pd.DataFrame([row])
-    # zawsze zapisujemy (nawet gdy sold_tickets None) – żeby commit poszedł
+    # Zawsze zapisujemy (nawet jeśli sold_tickets None), żeby workflow mógł commmitować plik
     if os.path.exists(path):
         df.to_csv(path, mode="a", header=False, index=False)
     else:
@@ -98,7 +96,11 @@ def main():
     if EVENT_ID and not EVENT_URL:
         EVENT_URL = f"https://bilety.wislakrakow.com/Stadium/Index?eventId={EVENT_ID}"
 
-    ts = datetime.now(timezone.utc).isoformat()
+    # === Timestamp: UTC + 2h, uproszczony format ===
+    now_utc = datetime.now(timezone.utc)
+    now_plus2 = now_utc + timedelta(hours=2)
+    ts = now_plus2.strftime("%Y-%m-%d %H:%M:%S")
+
     notes = []
     sold_tickets = None
     total_available = None
@@ -108,9 +110,9 @@ def main():
         ctx = browser.new_context(user_agent="Mozilla/5.0 (compatible; WislaTicketWatcher/1.0)")
         page = ctx.new_page()
 
-        # 1) Spróbuj NA STRONIE GŁÓWNEJ – tu zwykle jest 'Sprzedane bilety: X'
+        # 1) Spróbuj NA STRONIE GŁÓWNEJ – zwykle tu jest „Sprzedane bilety: X”
         try:
-            sold_tickets, body_home = try_read_sold_on(
+            sold_tickets, _ = try_read_sold_on(
                 page, "https://bilety.wislakrakow.com/", notes, wait_text_hint="Sprzedane"
             )
             if sold_tickets is not None:
@@ -118,10 +120,10 @@ def main():
         except Exception as e:
             notes.append(f"home_error: {e}")
 
-        # 2) Jeśli nie znaleziono – spróbuj na stronie eventu
+        # 2) Jeśli nie znaleziono – spróbuj na stronie konkretnego eventu
         if sold_tickets is None and EVENT_URL:
             try:
-                sold_tickets, body_event = try_read_sold_on(
+                sold_tickets, _ = try_read_sold_on(
                     page, EVENT_URL, notes, wait_text_hint="Sprzedane"
                 )
                 if sold_tickets is not None:
@@ -129,19 +131,19 @@ def main():
             except Exception as e:
                 notes.append(f"event_error: {e}")
 
-        # 3) Jeśli mamy pojemność – policz 'available'
+        # 3) Jeśli mamy pojemność – policz dostępne
         if CAPACITY and isinstance(sold_tickets, int):
             total_available = max(CAPACITY - sold_tickets, 0)
 
         browser.close()
 
     row = {
-        "timestamp_utc": ts,
+        "timestamp_utc_plus2": ts,  # czytelny timestamp po przesunięciu +2h
         "event_id": EVENT_ID,
         "event_url": EVENT_URL,
         "sold_tickets": sold_tickets,
         "total_available": total_available,
-        "sectors_json": "[]",  # zostawiamy pole dla zgodności
+        "sectors_json": "[]",  # miejsce na przyszłość; zostawiamy dla zgodności
         "success": True,
         "notes": "; ".join(notes) if notes else ""
     }
