@@ -1,11 +1,17 @@
 name: Wisla Tickets Watch (every 10 min)
+
 on:
   schedule:
     - cron: "*/10 * * * *"   # co 10 minut (UTC)
   workflow_dispatch:
 
 permissions:
-  contents: write            # pozwól na commit z Actions
+  contents: write
+
+# zapobiega konfliktom push przy równoległych uruchomieniach
+concurrency:
+  group: wisla-tickets
+  cancel-in-progress: true
 
 jobs:
   run:
@@ -13,6 +19,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
+          fetch-depth: 0               # potrzebne do pull --rebase
           persist-credentials: true
 
       - uses: actions/setup-python@v5
@@ -34,16 +41,24 @@ jobs:
 
       - name: Show files after scraper
         run: |
-          pwd
           ls -la
           echo "---- CSV content ----"
-          cat ticket_snapshots.csv || echo "Brak pliku!"
+          head -n 5 ticket_snapshots.csv || true
 
       - name: Commit CSV if changed
         run: |
+          set -e
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-          # jeśli pliku jeszcze nie ma w repo – dodaj go na pewno
+          BRANCH="${GITHUB_REF_NAME}"
+
+          # Dodaj wszystkie zmiany
           git add -A
           git commit -m "Update snapshots [skip ci]" || echo "No changes to commit"
-          git push
+
+          # Zsynchronizuj z origin (gdyby ktoś coś dorzucił międzyczasie)
+          git fetch origin "${BRANCH}"
+          git pull --rebase origin "${BRANCH}" || true
+
+          # Spróbuj push
+          git push origin "${BRANCH}" || git push --force-with-lease origin "${BRANCH}"
