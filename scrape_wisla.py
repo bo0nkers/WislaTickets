@@ -16,14 +16,11 @@ def parse_int(txt: str | None):
 
 def extract_data(page):
     """
-    Ekstrakcja dostępności miejsc:
-    1) próba policzenia per-sektor (aria-label/title/innerText)
-    2) fallback: globalny licznik z tekstu strony („Dostępne: …”)
-    Zwraca: (sectors:list[{'sector':str,'available':int}], total_available:int|None, notes:str)
+    1) Najpierw łapiemy dokładnie 'Sprzedane bilety: <liczba>'
+    2) (opcjonalnie) zbieramy dostępność per-sektor (fallback / dodatkowa metryka)
+    Zwraca: dict z polami: sold_tickets, total_available (opcjonalnie), sectors, notes
     """
     notes = []
-
-    # doczekaj do spokoju sieci
     page.wait_for_load_state("networkidle")
 
     # Cookie banner (jeśli jest)
@@ -35,62 +32,76 @@ def extract_data(page):
         except:
             pass
 
-    # Czekamy aż pojawi się mapa stadionu / listy sektorów (czyste CSS — bez 'css=' / 'text=' miksu)
-    page.wait_for_selector("svg, [data-testid*='sector'], [class*='sector']", timeout=20000)
-    # Nieważne, ale jeśli jest „KUP BILET”, spróbujmy poczekać chwilę (nie blokujące)
+    # Upewnijmy się, że treść strony jest wczytana
+    page.wait_for_selector("body", timeout=20000)
+
+    body_text = page.locator("body").inner_text()
+
+    # --- KLUCZ: 'Sprzedane bilety: <liczba>' ---
+    sold = None
+    # kilka wariantów na wszelki wypadek
+    for pattern in [
+        r"Sprzedane\s+bilety\s*:\s*(\d[\d\s\u00A0]*)",
+        r"Sprzedanych\s+biletów\s*:\s*(\d[\d\s\u00A0]*)",
+    ]:
+        m = re.search(pattern, body_text, re.I)
+        if m:
+            sold = parse_int(m.group(1))
+            break
+    if sold is None:
+        notes.append("Nie znaleziono wzorca 'Sprzedane bilety:'")
+
+    # --- Dodatkowo: spróbujmy policzyć dostępne per sektor (może być puste – to tylko dodatek) ---
+    sectors = []
+    total_available = None
     try:
-        page.get_by_text("KUP BILET", exact=False).first.wait_for(timeout=2000)
+        # czekamy na elementy sektorów, ale nie blokujemy jeśli ich nie ma
+        page.wait_for_selector("svg, [data-testid*='sector'], [class*='sector']", timeout=2000)
+        locs = page.locator("[data-testid*='sector'], [class*='sector'], [aria-label*='Sektor'], [aria-label*='sektor']")
+        count = locs.count()
+        for i in range(count):
+            el = locs.nth(i)
+            aria = el.get_attribute("aria-label")
+            title = el.get_attribute("title")
+            txt = ""
+            try:
+                txt = el.inner_text().strip()
+            except:
+                pass
+
+            name = None
+            avail = None
+            for cand in filter(None, [aria, title, txt]):
+                mname = re.search(r"(Sektor|Sector)\s*([A-Z]\d{0,2}|[A-Z]+)", cand, re.I)
+                if mname and not name:
+                    name = mname.group(2)
+                mfree = re.search(r"(dostępnych|available|wolnych)[^\d]*(\d[\d\s\u00A0]*)", cand, re.I)
+                if mfree and avail is None:
+                    avail = parse_int(mfree.group(2))
+            if name and isinstance(avail, int):
+                sectors.append({"sector": name, "available": avail})
+        if sectors:
+            total_available = sum(s["available"] for s in sectors)
     except:
         pass
 
-    sectors = []
-    try:
-        locs = page.locator("[data-testid*='sector'], [class*='sector'], [aria-label*='Sektor'], [aria-label*='sektor']")
-        count = locs.count()
-    except:
-        locs = None
-        count = 0
-
-    for i in range(count):
-        el = locs.nth(i)
-        aria = el.get_attribute("aria-label")
-        title = el.get_attribute("title")
-        txt = ""
-        try:
-            txt = el.inner_text().strip()
-        except:
-            pass
-
-        name = None
-        avail = None
-
-        for cand in filter(None, [aria, title, txt]):
-            # nazwa sektora (np. "Sektor B12")
-            mname = re.search(r"(Sektor|Sector)\s*([A-Z]\d{0,2}|[A-Z]+)", cand, re.I)
-            if mname and not name:
-                name = mname.group(2)
-            # liczba dostępnych miejsc
-            mfree = re.search(r"(dostępnych|available|wolnych)[^\d]*(\d[\d\s\u00A0]*)", cand, re.I)
-            if mfree and avail is None:
-                avail = parse_int(mfree.group(2))
-
-        if name and isinstance(avail, int):
-            sectors.append({"sector": name, "available": avail})
-
-    total_available = sum(s["available"] for s in sectors) if sectors else None
-
-    # Globalny fallback, jeśli nie udało się policzyć z sektorów
+    # Globalny fallback na 'Dostępne: X' (jeśli kiedyś pojawi się taka etykieta)
     if total_available is None:
-        body_text = page.locator("body").inner_text()
         m = re.search(r"(Dostępne|Available)\s*:\s*(\d[\d\s\u00A0]*)", body_text, re.I)
         if m:
             total_available = parse_int(m.group(2))
             notes.append("Used global 'Dostępne:' fallback")
 
-    return sectors, total_available, "; ".join(notes)
+    return {
+        "sold_tickets": sold,
+        "total_available": total_available,
+        "sectors": sectors,
+        "notes": "; ".join(notes)
+    }
 
 def to_csv(path, row: dict):
     df = pd.DataFrame([row])
+    # jeśli istnieje stary CSV z innymi kolumnami – usuń go w repo, żeby uniknąć mieszania nagłówków
     if os.path.exists(path):
         df.to_csv(path, mode="a", header=False, index=False)
     else:
@@ -105,6 +116,9 @@ def main():
     EVENT_URL = os.getenv("EVENT_URL") or (f"https://bilety.wislakrakow.com/Stadium/Index?eventId={EVENT_ID}" if EVENT_ID else "")
     OUTPUT_CSV = os.getenv("OUTPUT_CSV", "ticket_snapshots.csv")
     ALERT_THRESHOLD = int(os.getenv("ALERT_THRESHOLD", "0"))
+    # (opcjonalnie) podaj pojemność stadionu, wtedy policzymy dostępne = capacity - sold
+    CAPACITY = os.getenv("TOTAL_CAPACITY")  # np. 33000
+    CAPACITY = int(CAPACITY) if CAPACITY and CAPACITY.isdigit() else None
 
     if not EVENT_URL and not EVENT_ID:
         print("❌ Podaj EVENT_ID (parametr --event-id lub ENV EVENT_ID).", file=sys.stderr)
@@ -116,8 +130,12 @@ def main():
 
     success = False
     notes = ""
-    sectors = []
-    total_available = None
+    result = {
+        "sold_tickets": None,
+        "total_available": None,
+        "sectors": [],
+        "notes": ""
+    }
 
     with sync_playwright() as p:
         browser = p.chromium.launch(headless=True)
@@ -125,31 +143,38 @@ def main():
         page = ctx.new_page()
         page.goto(EVENT_URL, wait_until="domcontentloaded")
         try:
-            sectors, total_available, notes = extract_data(page)
+            result = extract_data(page)
             success = True
         except Exception as e:
-            notes = f"extract_error: {e}"
+            result["notes"] = f"extract_error: {e}"
         finally:
             browser.close()
+
+    # jeśli mamy pojemność i liczbę sprzedanych – policz dostępne
+    computed_available = None
+    if CAPACITY and isinstance(result.get("sold_tickets"), int):
+        computed_available = max(CAPACITY - result["sold_tickets"], 0)
 
     row = {
         "timestamp_utc": ts,
         "event_id": EVENT_ID,
         "event_url": EVENT_URL,
-        "total_available": total_available,
-        "sectors_json": json.dumps(sectors, ensure_ascii=False),
+        "sold_tickets": result.get("sold_tickets"),
+        # preferuj licznik z sektorów, a jeśli brak – użyj z pojemności (jeśli podana)
+        "total_available": result.get("total_available") if result.get("total_available") is not None else computed_available,
+        "sectors_json": json.dumps(result.get("sectors") or [], ensure_ascii=False),
         "success": success,
-        "notes": notes
+        "notes": result.get("notes","")
     }
 
     # CSV (repo)
     to_csv(OUTPUT_CSV, row)
 
-    # Prosty alert do loga/stdout
-    if ALERT_THRESHOLD and total_available is not None and total_available <= ALERT_THRESHOLD:
-        print(f"[ALERT] Dostępne miejsca ≤ {ALERT_THRESHOLD}: {total_available}")
+    # Prosty alert gdy zbliża się komplet – wykorzystaj próg do wczesnego powiadomienia
+    if ALERT_THRESHOLD and isinstance(row["total_available"], int) and row["total_available"] <= ALERT_THRESHOLD:
+        print(f"[ALERT] Dostępne miejsca ≤ {ALERT_THRESHOLD}: {row['total_available']}")
 
-    # Krótki JSON do logów Actions
+    # Log JSON (ułatwia diagnostykę w Actions)
     print(json.dumps(row, ensure_ascii=False))
 
 if __name__ == "__main__":
