@@ -43,5 +43,7 @@ jobs:
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add ticket_snapshots.csv
-          git diff --quiet && echo "No changes" || (git commit -m "Update snapshots [skip ci]" && git push)
+          # jeśli pliku jeszcze nie ma w repo – dodaj go na pewno
+          git add -A
+          git commit -m "Update snapshots [skip ci]" || echo "No changes to commit"
+          git push
