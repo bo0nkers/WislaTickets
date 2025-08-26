@@ -1,8 +1,8 @@
-import os, re, json, argparse, sys
+import os, re, json, argparse, sys, time
 from datetime import datetime, timezone
 from dotenv import load_dotenv
 import pandas as pd
-from playwright.sync_api import sync_playwright
+from playwright.sync_api import sync_playwright, TimeoutError as PWTimeout
 
 load_dotenv()
 
@@ -14,16 +14,28 @@ def parse_int(txt: str | None):
         return None
     return int(m.group(1).replace(" ", "").replace("\u00A0",""))
 
-def extract_data(page):
-    """
-    1) Najpierw łapiemy dokładnie 'Sprzedane bilety: <liczba>'
-    2) (opcjonalnie) zbieramy dostępność per-sektor (fallback / dodatkowa metryka)
-    Zwraca: dict z polami: sold_tickets, total_available (opcjonalnie), sectors, notes
-    """
-    notes = []
-    page.wait_for_load_state("networkidle")
+SOLD_PATTERNS = [
+    r"Sprzedane\s*bilety\s*[:\-]?\s*(\d[\d\s\u00A0]*)",
+    r"Sprzedanych\s*biletów\s*[:\-]?\s*(\d[\d\s\u00A0]*)",
+    r"Sprzedano\s*bilet[yów]*\s*[:\-]?\s*(\d[\d\s\u00A0]*)",
+]
 
-    # Cookie banner (jeśli jest)
+def find_sold_in_text(text: str):
+    if not text:
+        return None
+    for pat in SOLD_PATTERNS:
+        m = re.search(pat, text, re.I)
+        if m:
+            return parse_int(m.group(1))
+    return None
+
+def try_read_sold_on(page, url, notes, wait_text_hint=None):
+    """
+    Otwiera URL, czeka aż strona się uspokoi i szuka 'Sprzedane bilety: X' w inner_text body.
+    Opcjonalnie może krótko poczekać na tekst-hint (np. 'Sprzedane bilety').
+    """
+    page.goto(url, wait_until="domcontentloaded")
+    # cookies / zgody
     for label in ["Tylko niezbędne dane", "Zgadzam się", "Akceptuj", "Accept"]:
         try:
             page.get_by_text(label, exact=False).first.click(timeout=1500)
@@ -32,76 +44,37 @@ def extract_data(page):
         except:
             pass
 
-    # Upewnijmy się, że treść strony jest wczytana
-    page.wait_for_selector("body", timeout=20000)
-
-    body_text = page.locator("body").inner_text()
-
-    # --- KLUCZ: 'Sprzedane bilety: <liczba>' ---
-    sold = None
-    # kilka wariantów na wszelki wypadek
-    for pattern in [
-        r"Sprzedane\s+bilety\s*:\s*(\d[\d\s\u00A0]*)",
-        r"Sprzedanych\s+biletów\s*:\s*(\d[\d\s\u00A0]*)",
-    ]:
-        m = re.search(pattern, body_text, re.I)
-        if m:
-            sold = parse_int(m.group(1))
-            break
-    if sold is None:
-        notes.append("Nie znaleziono wzorca 'Sprzedane bilety:'")
-
-    # --- Dodatkowo: spróbujmy policzyć dostępne per sektor (może być puste – to tylko dodatek) ---
-    sectors = []
-    total_available = None
     try:
-        # czekamy na elementy sektorów, ale nie blokujemy jeśli ich nie ma
-        page.wait_for_selector("svg, [data-testid*='sector'], [class*='sector']", timeout=2000)
-        locs = page.locator("[data-testid*='sector'], [class*='sector'], [aria-label*='Sektor'], [aria-label*='sektor']")
-        count = locs.count()
-        for i in range(count):
-            el = locs.nth(i)
-            aria = el.get_attribute("aria-label")
-            title = el.get_attribute("title")
-            txt = ""
-            try:
-                txt = el.inner_text().strip()
-            except:
-                pass
+        page.wait_for_load_state("networkidle", timeout=15000)
+    except PWTimeout:
+        notes.append("networkidle timeout")
 
-            name = None
-            avail = None
-            for cand in filter(None, [aria, title, txt]):
-                mname = re.search(r"(Sektor|Sector)\s*([A-Z]\d{0,2}|[A-Z]+)", cand, re.I)
-                if mname and not name:
-                    name = mname.group(2)
-                mfree = re.search(r"(dostępnych|available|wolnych)[^\d]*(\d[\d\s\u00A0]*)", cand, re.I)
-                if mfree and avail is None:
-                    avail = parse_int(mfree.group(2))
-            if name and isinstance(avail, int):
-                sectors.append({"sector": name, "available": avail})
-        if sectors:
-            total_available = sum(s["available"] for s in sectors)
+    # czasem tekst doskakuje chwilę później (JS)
+    if wait_text_hint:
+        try:
+            page.get_by_text(wait_text_hint, exact=False).first.wait_for(timeout=3000)
+        except:
+            pass
+    else:
+        try:
+            page.wait_for_selector("body", timeout=10000)
+        except:
+            pass
+
+    # dajmy JS jeszcze ułamek sekundy
+    time.sleep(0.5)
+
+    try:
+        body_text = page.locator("body").inner_text()
     except:
-        pass
+        body_text = ""
 
-    # Globalny fallback na 'Dostępne: X' (jeśli kiedyś pojawi się taka etykieta)
-    if total_available is None:
-        m = re.search(r"(Dostępne|Available)\s*:\s*(\d[\d\s\u00A0]*)", body_text, re.I)
-        if m:
-            total_available = parse_int(m.group(2))
-            notes.append("Used global 'Dostępne:' fallback")
+    sold = find_sold_in_text(body_text)
+    return sold, body_text
 
-    return {
-        "sold_tickets": sold,
-        "total_available": total_available,
-        "sectors": sectors,
-        "notes": "; ".join(notes)
-    }
-
-def to_csv(path, row: dict):
+def save_row_csv(path, row: dict):
     df = pd.DataFrame([row])
-    # jeśli istnieje stary CSV z innymi kolumnami – usuń go w repo, żeby uniknąć mieszania nagłówków
+    # zawsze zapisujemy (nawet gdy sold_tickets None) – żeby commit poszedł
     if os.path.exists(path):
         df.to_csv(path, mode="a", header=False, index=False)
     else:
@@ -116,8 +89,7 @@ def main():
     EVENT_URL = os.getenv("EVENT_URL") or (f"https://bilety.wislakrakow.com/Stadium/Index?eventId={EVENT_ID}" if EVENT_ID else "")
     OUTPUT_CSV = os.getenv("OUTPUT_CSV", "ticket_snapshots.csv")
     ALERT_THRESHOLD = int(os.getenv("ALERT_THRESHOLD", "0"))
-    # (opcjonalnie) podaj pojemność stadionu, wtedy policzymy dostępne = capacity - sold
-    CAPACITY = os.getenv("TOTAL_CAPACITY")  # np. 33000
+    CAPACITY = os.getenv("TOTAL_CAPACITY")
     CAPACITY = int(CAPACITY) if CAPACITY and CAPACITY.isdigit() else None
 
     if not EVENT_URL and not EVENT_ID:
@@ -127,54 +99,58 @@ def main():
         EVENT_URL = f"https://bilety.wislakrakow.com/Stadium/Index?eventId={EVENT_ID}"
 
     ts = datetime.now(timezone.utc).isoformat()
-
-    success = False
-    notes = ""
-    result = {
-        "sold_tickets": None,
-        "total_available": None,
-        "sectors": [],
-        "notes": ""
-    }
+    notes = []
+    sold_tickets = None
+    total_available = None
 
     with sync_playwright() as p:
         browser = p.chromium.launch(headless=True)
         ctx = browser.new_context(user_agent="Mozilla/5.0 (compatible; WislaTicketWatcher/1.0)")
         page = ctx.new_page()
-        page.goto(EVENT_URL, wait_until="domcontentloaded")
-        try:
-            result = extract_data(page)
-            success = True
-        except Exception as e:
-            result["notes"] = f"extract_error: {e}"
-        finally:
-            browser.close()
 
-    # jeśli mamy pojemność i liczbę sprzedanych – policz dostępne
-    computed_available = None
-    if CAPACITY and isinstance(result.get("sold_tickets"), int):
-        computed_available = max(CAPACITY - result["sold_tickets"], 0)
+        # 1) Spróbuj NA STRONIE GŁÓWNEJ – tu zwykle jest 'Sprzedane bilety: X'
+        try:
+            sold_tickets, body_home = try_read_sold_on(
+                page, "https://bilety.wislakrakow.com/", notes, wait_text_hint="Sprzedane"
+            )
+            if sold_tickets is not None:
+                notes.append("sold from homepage")
+        except Exception as e:
+            notes.append(f"home_error: {e}")
+
+        # 2) Jeśli nie znaleziono – spróbuj na stronie eventu
+        if sold_tickets is None and EVENT_URL:
+            try:
+                sold_tickets, body_event = try_read_sold_on(
+                    page, EVENT_URL, notes, wait_text_hint="Sprzedane"
+                )
+                if sold_tickets is not None:
+                    notes.append("sold from event page")
+            except Exception as e:
+                notes.append(f"event_error: {e}")
+
+        # 3) Jeśli mamy pojemność – policz 'available'
+        if CAPACITY and isinstance(sold_tickets, int):
+            total_available = max(CAPACITY - sold_tickets, 0)
+
+        browser.close()
 
     row = {
         "timestamp_utc": ts,
         "event_id": EVENT_ID,
         "event_url": EVENT_URL,
-        "sold_tickets": result.get("sold_tickets"),
-        # preferuj licznik z sektorów, a jeśli brak – użyj z pojemności (jeśli podana)
-        "total_available": result.get("total_available") if result.get("total_available") is not None else computed_available,
-        "sectors_json": json.dumps(result.get("sectors") or [], ensure_ascii=False),
-        "success": success,
-        "notes": result.get("notes","")
+        "sold_tickets": sold_tickets,
+        "total_available": total_available,
+        "sectors_json": "[]",  # zostawiamy pole dla zgodności
+        "success": True,
+        "notes": "; ".join(notes) if notes else ""
     }
 
-    # CSV (repo)
-    to_csv(OUTPUT_CSV, row)
+    save_row_csv(OUTPUT_CSV, row)
 
-    # Prosty alert gdy zbliża się komplet – wykorzystaj próg do wczesnego powiadomienia
-    if ALERT_THRESHOLD and isinstance(row["total_available"], int) and row["total_available"] <= ALERT_THRESHOLD:
-        print(f"[ALERT] Dostępne miejsca ≤ {ALERT_THRESHOLD}: {row['total_available']}")
+    if ALERT_THRESHOLD and isinstance(total_available, int) and total_available <= ALERT_THRESHOLD:
+        print(f"[ALERT] Dostępne miejsca ≤ {ALERT_THRESHOLD}: {total_available}")
 
-    # Log JSON (ułatwia diagnostykę w Actions)
     print(json.dumps(row, ensure_ascii=False))
 
 if __name__ == "__main__":
