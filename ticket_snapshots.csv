@@ -337,3 +337,4 @@ timestamp_utc,event_id,event_url,sold_tickets,total_available,sectors_json,succe
 2025-08-31 12:01:20,9045,https://bilety.wislakrakow.com/Stadium/Index?eventId=9045,25393,,[],True,sold from homepage
 2025-08-31 12:27:25,9045,https://bilety.wislakrakow.com/Stadium/Index?eventId=9045,25400,,[],True,sold from homepage
 2025-08-31 12:42:32,9045,https://bilety.wislakrakow.com/Stadium/Index?eventId=9045,25407,,[],True,sold from homepage
+2025-08-31 12:57:33,9045,https://bilety.wislakrakow.com/Stadium/Index?eventId=9045,25415,,[],True,sold from homepage
